@@ -1,0 +1,167 @@
+  #include <Arduino.h>
+  #include <WiFi.h>
+  #include <ESP32Servo.h>
+  #include <micro_ros_arduino.h>
+
+  #include <rcl/rcl.h>
+  #include <rclc/rclc.h>
+  #include <rclc/executor.h>
+  #include <std_msgs/msg/int32.h>
+
+  // --- Configuration ---
+  #define WIFI_SSID
+  #define WIFI_PASS
+  #define AGENT_IP  "192.168.19.101"
+  #define AGENT_PORT 8888
+  #define DOMAIN_ID  42
+
+  // WT32-ETH01 Recommended Pins
+  #define SERVO_PIN 4      
+  #define INPUT_PIN 12    
+  #define LED_PIN   14    // External LED (Active LOW logic)
+
+  // --- ROS Objects ---
+  rcl_subscription_t sub_sequence, sub_hold;
+  std_msgs__msg__Int32 msg_seq, msg_hold;
+  rclc_executor_t executor;
+  rclc_support_t support;
+  rcl_node_t node;
+  rcl_allocator_t allocator;
+  Servo s1;
+
+  // --- State Variables ---
+  int32_t persistent_angle = 90;
+  unsigned long sequence_start_time = 0;
+  enum ServoState { IDLE, MOVING_TO_TARGET, RETURNING_TO_180 };
+  ServoState servo_state = IDLE;
+  bool last_pin_state = HIGH;
+
+  enum DeviceState { WAITING_WIFI, AGENT_DISCONNECTED, AGENT_CONNECTED };
+  DeviceState device_state = WAITING_WIFI;
+
+  // ================== RELIABILITY HELPERS ==================
+
+  void destroy_entities() {
+    Serial.println("Cleaning up ROS entities...");
+    rmw_context_t * rmw_context = rcl_context_get_rmw_context(&support.context);
+    (void) rmw_uros_set_context_entity_destroy_session_timeout(rmw_context, 0);
+
+    rclc_executor_fini(&executor);
+    rcl_subscription_fini(&sub_sequence, &node);
+    rcl_subscription_fini(&sub_hold, &node);
+    rcl_node_fini(&node);
+    rclc_support_fini(&support);
+  }
+
+  bool create_entities() {
+    allocator = rcl_get_default_allocator();
+    rcl_init_options_t opts = rcl_get_zero_initialized_init_options();
+    rcl_init_options_init(&opts, allocator);
+    rcl_init_options_set_domain_id(&opts, DOMAIN_ID);
+
+    // Randomize client key to force Agent to forget old "ghost" sessions
+    rmw_init_options_t* rmw_opts = rcl_init_options_get_rmw_init_options(&opts);
+    (void) rmw_uros_options_set_client_key((uint32_t)random(), rmw_opts); 
+
+    if (rclc_support_init_with_options(&support, 0, NULL, &opts, &allocator) != RCL_RET_OK) return false;
+    rcl_init_options_fini(&opts);
+
+    if (rclc_node_init_default(&node, "wt32_wifi_node", "", &support) != RCL_RET_OK) return false;
+
+    rclc_subscription_init_best_effort(&sub_sequence, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Int32), "trigger");
+    rclc_subscription_init_best_effort(&sub_hold, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Int32), "servo_hold");
+
+    rclc_executor_init(&executor, &support.context, 2, &allocator);
+    rclc_executor_add_subscription(&executor, &sub_sequence, &msg_seq, &callback_sequence, ON_NEW_DATA);
+    rclc_executor_add_subscription(&executor, &sub_hold, &msg_hold, &callback_hold, ON_NEW_DATA);
+
+    return true;
+  }
+
+  // ================== LOGIC & CALLBACKS ==================
+
+  void execute_sequence_action(int32_t angle) {
+    if (servo_state == IDLE) {
+      persistent_angle = angle;
+      digitalWrite(LED_PIN, LOW); // ON
+      servo_state = MOVING_TO_TARGET;
+      sequence_start_time = millis();
+      s1.write(180 - persistent_angle);
+    }
+  }
+
+  void callback_sequence(const void* msgin) {
+    const std_msgs__msg__Int32* incoming_msg = (const std_msgs__msg__Int32*)msgin;
+    if (incoming_msg->data > 0) execute_sequence_action(incoming_msg->data);
+  }
+
+  void callback_hold(const void* msgin) {
+    const std_msgs__msg__Int32* incoming_msg = (const std_msgs__msg__Int32*)msgin;
+    servo_state = IDLE;
+    persistent_angle = incoming_msg->data;
+    s1.write(180 - persistent_angle);
+  }
+
+  // ================== SETUP & LOOP ==================
+
+  void setup() {
+    Serial.begin(115200);
+    randomSeed(micros());
+
+    pinMode(INPUT_PIN, INPUT_PULLUP);
+    pinMode(LED_PIN, OUTPUT);
+    digitalWrite(LED_PIN, HIGH); // OFF
+
+    s1.attach(SERVO_PIN);
+    s1.write(180);
+
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+    set_microros_wifi_transports((char*)WIFI_SSID, (char*)WIFI_PASS, (char*)AGENT_IP, AGENT_PORT);
+  }
+
+  void loop() {
+    static uint32_t last_ping = 0;
+
+    // 1. Connection State Machine
+    switch (device_state) {
+      case WAITING_WIFI:
+        if (WiFi.status() == WL_CONNECTED) device_state = AGENT_DISCONNECTED;
+        break;
+      case AGENT_DISCONNECTED:
+        if (millis() - last_ping > 1000) {
+          last_ping = millis();
+          if (rmw_uros_ping_agent(100, 1) == RCL_RET_OK) {
+            if (create_entities()) device_state = AGENT_CONNECTED;
+          }
+        }
+        break;
+      case AGENT_CONNECTED:
+        if (millis() - last_ping > 2000) {
+          last_ping = millis();
+          if (rmw_uros_ping_agent(100, 1) != RCL_RET_OK) {
+            destroy_entities();
+            device_state = AGENT_DISCONNECTED;
+          }
+        } else {
+          rclc_executor_spin_some(&executor, RCL_MS_TO_NS(10));
+        }
+        break;
+    }
+
+    // 2. Button Logic
+    bool current_pin_state = digitalRead(INPUT_PIN);
+    if (current_pin_state == LOW && last_pin_state == HIGH) execute_sequence_action(persistent_angle);
+    last_pin_state = current_pin_state;
+
+    // 3. Servo Timing
+    if (servo_state == MOVING_TO_TARGET && (millis() - sequence_start_time >= 500)) {
+      s1.write(180);
+      servo_state = RETURNING_TO_180;
+      sequence_start_time = millis();
+    } else if (servo_state == RETURNING_TO_180 && (millis() - sequence_start_time >= 500)) {
+      servo_state = IDLE;
+      digitalWrite(LED_PIN, HIGH); // OFF
+    }
+
+    vTaskDelay(1); 
+  }
