@@ -1,0 +1,205 @@
+#include <Arduino.h>
+#include <ETH.h>
+#include <ESP32Servo.h>
+#include <micro_ros_arduino.h>
+
+#include <rcl/rcl.h>
+#include <rclc/rclc.h>
+#include <rclc/executor.h>
+#include <std_msgs/msg/int32.h>
+
+// --- WT32-ETH01 Hardware Mapping ---
+#define ETH_PHY_ADDR         1
+#define ETH_PHY_POWER        16
+#define ETH_PHY_MDC          23
+#define ETH_PHY_MDIO         18
+#define ETH_PHY_TYPE         ETH_PHY_LAN8720
+// NOTE: If the board still hangs, try changing this to ETH_CLOCK_GPIO17_OUT
+#define ETH_CLK_MODE         ETH_CLOCK_GPIO0_IN 
+
+// --- User Config ---
+#define AGENT_IP             "192.168.1.150"
+#define AGENT_PORT           8888
+#define DOMAIN_ID            42
+#define SERVO_PIN            4
+
+// --- STATIC IP CONFIGURATION ---
+// Matching your 192.168.1.x subnet
+IPAddress local_IP(192, 168, 1, 50);  // IP for this ESP32
+IPAddress gateway(192, 168, 1, 1);   // Your router IP
+IPAddress subnet(255, 255, 255, 0);
+IPAddress dns(8, 8, 8, 8);
+
+// --- ROS Objects ---
+rcl_subscription_t sub_sequence, sub_hold;
+std_msgs__msg__Int32 msg_seq, msg_hold;
+rclc_executor_t executor;
+rclc_support_t support;
+rcl_node_t node;
+rcl_allocator_t allocator;
+Servo s1;
+
+// --- State Tracking ---
+enum states { WAIT_ETH, WAIT_AGENT, AGENT_CONNECTED };
+states device_state = WAIT_ETH;
+
+unsigned long seq_timer = 0;
+enum { IDLE, MOVING, RETURNING } servo_state = IDLE;
+
+#define RCCHECK(fn, msg) { rcl_ret_t temp_rc = fn; if((temp_rc != RCL_RET_OK)){ \
+    Serial.printf("\n[!!! FATAL ERROR] %s failed (Error Code: %d)\n", msg, (int)temp_rc); \
+    return false; } else { Serial.printf("[SUCCESS] %s\n", msg); }}
+
+// ================== CALLBACKS ==================
+
+void cb_sequence(const void* msgin) {
+  const std_msgs__msg__Int32* msg = (const std_msgs__msg__Int32*)msgin;
+  Serial.printf("\n>>> [MESSAGE] Topic: /trigger | Data: %d\n", msg->data);
+  if (msg->data >= 0 && msg->data <= 180 && servo_state == IDLE) {
+    s1.write(msg->data);
+    servo_state = MOVING;
+    seq_timer = millis();
+  }
+}
+
+void cb_hold(const void* msgin) {
+  const std_msgs__msg__Int32* msg = (const std_msgs__msg__Int32*)msgin;
+  Serial.printf("\n>>> [MESSAGE] Topic: /servo_hold | Data: %d\n", msg->data);
+  if (msg->data >= 0 && msg->data <= 180) {
+    servo_state = IDLE;
+    s1.write(msg->data);
+  }
+}
+
+// ================== ROS INITIALIZATION ==================
+
+bool create_entities() {
+  Serial.println("\n--- [STEP 4] INITIALIZING ROS ENTITIES ---");
+  allocator = rcl_get_default_allocator();
+
+  rcl_init_options_t init_options = rcl_get_zero_initialized_init_options();
+  RCCHECK(rcl_init_options_init(&init_options, allocator), "RCL Init Options");
+  RCCHECK(rcl_init_options_set_domain_id(&init_options, DOMAIN_ID), "Setting Domain ID 42");
+  RCCHECK(rclc_support_init_with_options(&support, 0, NULL, &init_options, &allocator), "Support Layer");
+
+  RCCHECK(rclc_node_init_default(&node, "wt32_eth_servo", "", &support), "Node 'wt32_eth_servo'");
+
+  RCCHECK(rclc_subscription_init_default(&sub_sequence, &node, 
+    ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Int32), "trigger"), "Sub 'trigger'");
+  
+  RCCHECK(rclc_subscription_init_default(&sub_hold, &node, 
+    ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Int32), "servo_hold"), "Sub 'servo_hold'");
+
+  RCCHECK(rclc_executor_init(&executor, &support.context, 2, &allocator), "Executor Init");
+  RCCHECK(rclc_executor_add_subscription(&executor, &sub_sequence, &msg_seq, &cb_sequence, ON_NEW_DATA), "Linking 'trigger'");
+  RCCHECK(rclc_executor_add_subscription(&executor, &sub_hold, &msg_hold, &cb_hold, ON_NEW_DATA), "Linking 'servo_hold'");
+
+  Serial.println("\n--- [RESULT] ALL ROS ENTITIES ACTIVE ---\n");
+  return true;
+}
+
+void destroy_entities() {
+  Serial.println("\n--- [SYSTEM] CLEANING UP SESSION ---");
+  rcl_subscription_fini(&sub_sequence, &node);
+  rcl_subscription_fini(&sub_hold, &node);
+  rclc_executor_fini(&executor);
+  rcl_node_fini(&node);
+  rclc_support_fini(&support);
+}
+
+// ================== MAIN SETUP & LOOP ==================
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  Serial.println("\n========================================");
+  Serial.println("  WT32-ETH01 STATIC IP STARTUP");
+  Serial.println("========================================\n");
+  
+  s1.attach(SERVO_PIN);
+  s1.write(180);
+
+  Serial.println("--- [STEP 1] HARDWARE RESET ---");
+  pinMode(ETH_PHY_POWER, OUTPUT);
+  digitalWrite(ETH_PHY_POWER, LOW);
+  delay(300);
+  digitalWrite(ETH_PHY_POWER, HIGH);
+  delay(200);
+  
+  // Apply Static IP Configuration
+  Serial.println("[ETH] Applying Static IP Settings...");
+  if (!ETH.config(local_IP, gateway, subnet, dns)) {
+    Serial.println("[ERROR] Static IP Config Failed!");
+  }
+
+  Serial.println("[ETH] Initializing LAN8720...");
+  ETH.begin(ETH_PHY_TYPE, ETH_PHY_ADDR, ETH_PHY_MDC, ETH_PHY_MDIO, ETH_PHY_POWER, ETH_CLK_MODE);
+  
+  Serial.printf("[ROS] Target Agent: %s:%d\n", AGENT_IP, AGENT_PORT);
+  set_microros_wifi_transports((char*)"", (char*)"", (char*)AGENT_IP, AGENT_PORT);
+}
+
+void loop() {
+  static unsigned long last_diagnostic_time = 0;
+
+  switch (device_state) {
+    case WAIT_ETH:
+      // Heartbeat every 2 seconds while waiting for Ethernet
+      if (millis() - last_diagnostic_time > 2000) {
+        last_diagnostic_time = millis();
+        bool link = ETH.linkUp();
+        Serial.printf("[ETH] Waiting for Link... Status: %s | Current IP: %s\n", 
+                      link ? "READY" : "NO CABLE", 
+                      ETH.localIP().toString().c_str());
+        
+        // If we have an IP and link, move to Step 3
+        if (link && ETH.localIP()[0] != 0) {
+          Serial.println("\n--- [STEP 2] ETHERNET LINK VERIFIED ---");
+          Serial.printf("[INFO] Assigned IP: %s\n", ETH.localIP().toString().c_str());
+          device_state = WAIT_AGENT;
+        }
+      }
+      break;
+
+    case WAIT_AGENT:
+      if (millis() - last_diagnostic_time > 2000) {
+        last_diagnostic_time = millis();
+        Serial.println("\n--- [STEP 3] SEARCHING FOR AGENT ---");
+        Serial.printf("[PING] Heartbeat to %s...\n", AGENT_IP);
+        
+        if (rmw_uros_ping_agent(100, 1) == RCL_RET_OK) {
+          Serial.println("[PING] SUCCESS! Agent responded.");
+          if (create_entities()) {
+            device_state = AGENT_CONNECTED;
+          }
+        } else {
+          Serial.println("[PING] FAILED. No response from Agent.");
+        }
+      }
+      break;
+
+    case AGENT_CONNECTED:
+      if (millis() - last_diagnostic_time > 5000) {
+        last_diagnostic_time = millis();
+        if (rmw_uros_ping_agent(100, 1) != RCL_RET_OK) {
+          Serial.println("\n[!!!] Connection to Agent Lost!");
+          destroy_entities();
+          device_state = WAIT_AGENT;
+        }
+      } else {
+        rclc_executor_spin_some(&executor, 0);
+      }
+      break;
+  }
+
+  // --- Servo Timing ---
+  if (servo_state == MOVING && (millis() - seq_timer >= 1000)) {
+    s1.write(180);
+    servo_state = RETURNING;
+    seq_timer = millis();
+  } else if (servo_state == RETURNING && (millis() - seq_timer >= 500)) {
+    servo_state = IDLE;
+  }
+
+  delay(1);
+}
